@@ -1,4 +1,6 @@
 const crypto = require('node:crypto');
+const dns = require('node:dns').promises;
+const net = require('node:net');
 
 const VALID_STATUSES = new Set(['unassessed', 'supported', 'mixed', 'not_observed', 'insufficient', 'not_applicable']);
 const RUBRIC = [
@@ -31,6 +33,41 @@ const schema = {
 };
 
 function cleanText(value, max = 5000) { return String(value || '').trim().slice(0, max); }
+
+function isPrivateIp(address) {
+  if (net.isIPv4(address)) {
+    const p = address.split('.').map(Number);
+    return p[0] === 10 || p[0] === 127 || p[0] === 0 || (p[0] === 169 && p[1] === 254) ||
+      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) || (p[0] === 192 && p[1] === 168) || p[0] >= 224;
+  }
+  const ip = String(address || '').toLowerCase();
+  return ip === '::1' || ip === '::' || ip.startsWith('fc') || ip.startsWith('fd') || /^fe[89ab]/.test(ip);
+}
+
+async function safeBaseUrl(value) {
+  let url;
+  try { url = new URL(value); } catch { throw new Error('رابط مزود الذكاء الاصطناعي غير صالح.'); }
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error('يجب أن يكون رابط المزود HTTPS ومن دون بيانات دخول داخله.');
+  const host = url.hostname.toLowerCase();
+  if (host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) throw new Error('عنوان مزود الذكاء الاصطناعي غير مسموح.');
+  const records = await dns.lookup(host, { all: true, verbatim: true });
+  if (!records.length || records.some(record => isPrivateIp(record.address))) throw new Error('عنوان مزود الذكاء الاصطناعي غير مسموح.');
+  return `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
+}
+
+function openAiText(raw) {
+  if (typeof raw?.output_text === 'string') return raw.output_text;
+  return (Array.isArray(raw?.output) ? raw.output : []).flatMap(item => Array.isArray(item?.content) ? item.content : [])
+    .filter(item => item?.type === 'output_text' || typeof item?.text === 'string').map(item => item.text || '').join('');
+}
+
+function strictJsonSchema(value) {
+  if (Array.isArray(value)) return value.map(strictJsonSchema);
+  if (!value || typeof value !== 'object') return value;
+  const result = Object.fromEntries(Object.entries(value).map(([key, item]) => [key, strictJsonSchema(item)]));
+  if (result.type === 'object') result.additionalProperties = false;
+  return result;
+}
 
 function buildPrompt(caseFile, language, sources) {
   const sourceBlock = sources.map((s, i) => `\n--- SOURCE ${i + 1} ---\nID: ${s.id}\nTitle: ${s.title}\nPublisher: ${s.publisher || 'unknown'}\nAuthor: ${s.author || 'unknown'}\nDate: ${s.date || 'unknown'}\nShared origin: ${s.origin || 'not supplied'}\nURL: ${s.url || 'not supplied'}\nNotes: ${s.notes || 'none'}\nTEXT:\n${s.text}`).join('\n');
@@ -66,8 +103,9 @@ ${sourceBlock}`;
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-  const apiKey = cleanText(req.body?.geminiKey, 300);
-  if (apiKey.length < 20) return res.status(401).json({ error: 'مفتاح Gemini مفقود أو غير صالح.' });
+  const apiKey = cleanText(req.body?.apiKey || req.body?.geminiKey, 500);
+  if (apiKey.length < 12) return res.status(401).json({ error: 'مفتاح مزود الذكاء الاصطناعي مفقود أو غير صالح.' });
+  const provider = ['gemini', 'openai', 'custom'].includes(req.body?.provider) ? req.body.provider : 'gemini';
   const caseFile = req.body?.case;
   if (!caseFile || !Array.isArray(caseFile.sources) || !caseFile.sources.length) return res.status(400).json({ error: 'أضف مصدرًا واحدًا على الأقل.' });
   if (caseFile.sources.length > 12) return res.status(400).json({ error: 'الحد الأقصى 12 مصدرًا في العملية الواحدة.' });
@@ -81,23 +119,38 @@ module.exports = async function handler(req, res) {
   }).filter(s => s.id && s.text);
   if (!sources.length) return res.status(400).json({ error: 'لا توجد نصوص مصادر صالحة للتحليل.' });
 
-  const requestedModel = cleanText(req.body?.model, 100);
-  const model = /^[a-zA-Z0-9._-]+$/.test(requestedModel) ? requestedModel : (process.env.GEMINI_MODEL || 'gemini-2.5-flash');
+  const requestedModel = cleanText(req.body?.model, 160);
+  if (requestedModel && !/^[a-zA-Z0-9._:/-]+$/.test(requestedModel)) return res.status(400).json({ error: 'معرّف النموذج غير صالح.' });
+  const model = requestedModel || (provider === 'gemini' ? 'gemini-2.5-flash' : 'gpt-6.1-sol');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 55000);
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
-      method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: buildPrompt(caseFile, cleanText(req.body.language, 80) || 'Arabic', sources) }] }],
-        generationConfig: { temperature: 0.15, responseMimeType: 'application/json', responseSchema: schema }
-      })
-    });
+    const prompt = buildPrompt(caseFile, cleanText(req.body.language, 80) || 'Arabic', sources);
+    let endpoint, headers = { 'Content-Type': 'application/json' }, payload, providerLabel;
+    if (provider === 'gemini') {
+      if (!/^[a-zA-Z0-9._-]+$/.test(model)) return res.status(400).json({ error: 'معرّف نموذج Gemini غير صالح.' });
+      endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      payload = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.15, responseMimeType: 'application/json', responseSchema: schema } };
+      providerLabel = 'Google Gemini';
+    } else if (provider === 'openai') {
+      endpoint = 'https://api.openai.com/v1/responses';
+      headers.Authorization = `Bearer ${apiKey}`;
+      payload = { model, input: prompt, text: { format: { type: 'json_schema', name: 'raqeeb_analysis', strict: true, schema: strictJsonSchema(schema) } } };
+      providerLabel = 'OpenAI';
+    } else {
+      const base = await safeBaseUrl(cleanText(req.body?.baseUrl, 1000));
+      endpoint = `${base}/chat/completions`;
+      headers.Authorization = `Bearer ${apiKey}`;
+      payload = { model, messages: [{ role: 'user', content: prompt }], temperature: 0.15, response_format: { type: 'json_object' } };
+      providerLabel = new URL(base).hostname;
+    }
+    const response = await fetch(endpoint, { method: 'POST', signal: controller.signal, headers, body: JSON.stringify(payload) });
     const raw = await response.json();
-    if (!response.ok) return res.status(502).json({ error: raw?.error?.message || 'فشل اتصال Gemini.' });
-    const text = raw?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
+    if (!response.ok) return res.status(502).json({ error: raw?.error?.message || `فشل الاتصال مع ${providerLabel}.` });
+    const text = provider === 'gemini' ? (raw?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '') :
+      provider === 'openai' ? openAiText(raw) : (raw?.choices?.[0]?.message?.content || '');
     let parsed;
-    try { parsed = JSON.parse(text); } catch { return res.status(502).json({ error: 'أعاد Gemini نتيجة غير قابلة للقراءة. أعد المحاولة.' }); }
+    try { parsed = JSON.parse(text); } catch { return res.status(502).json({ error: `أعاد ${providerLabel} نتيجة غير قابلة للقراءة. أعد المحاولة أو اختر نموذجًا يدعم JSON.` }); }
     const sourceMap = new Map(sources.map(s => [s.id, s]));
     const reviews = {};
     for (const item of Array.isArray(parsed.reviews) ? parsed.reviews : []) {
@@ -109,7 +162,7 @@ module.exports = async function handler(req, res) {
         status: VALID_STATUSES.has(item.status) ? item.status : 'insufficient',
         confidence: ['low', 'medium', 'high'].includes(item.confidence) ? item.confidence : 'low',
         source_id: source ? item.source_id : '', quote: source ? quote : '', quote_match: Boolean(source && quote && source.text.includes(quote)),
-        observation: cleanText(item.observation, 3000), alternative: cleanText(item.alternative, 2000), next_step: cleanText(item.next_step, 2000), author: 'Google Gemini'
+        observation: cleanText(item.observation, 3000), alternative: cleanText(item.alternative, 2000), next_step: cleanText(item.next_step, 2000), author: providerLabel
       };
     }
     for (let axis = 1; axis <= 9; axis++) for (let q = 1; q <= 5; q++) {
@@ -120,11 +173,11 @@ module.exports = async function handler(req, res) {
     const claims = (Array.isArray(parsed.claims) ? parsed.claims : []).slice(0, 20).map(c => ({ claim: cleanText(c.claim, 1200), verdict: cleanText(c.verdict, 300), reason: cleanText(c.reason, 2500), source_ids: (Array.isArray(c.source_ids) ? c.source_ids : []).filter(id => validIds.has(id)) }));
     const scenarios = (Array.isArray(parsed.scenarios) ? parsed.scenarios : []).slice(0, 8).map(s => ({ name: cleanText(s.name, 300), assessment: cleanText(s.assessment, 1500), support: cleanText(s.support, 2000), against: cleanText(s.against, 2000), trigger: cleanText(s.trigger, 2000) }));
     return res.status(200).json({
-      id: crypto.randomUUID(), created: new Date().toISOString(), mode: 'ai', provider: 'Google Gemini', model, methodology: '0.2', language: cleanText(req.body.language, 80) || 'Arabic',
+      id: crypto.randomUUID(), created: new Date().toISOString(), mode: 'ai', provider: providerLabel, model, methodology: '0.2', language: cleanText(req.body.language, 80) || 'Arabic',
       summary: cleanText(parsed.summary, 8000), claims, scenarios, limitations: (Array.isArray(parsed.limitations) ? parsed.limitations : []).slice(0, 20).map(v => cleanText(v, 1500)),
-      reviews, sources: caseFile.sources, changes: '', usage: { input_tokens: raw.usageMetadata?.promptTokenCount || null, output_tokens: raw.usageMetadata?.candidatesTokenCount || null }
+      reviews, sources: caseFile.sources, changes: '', usage: { input_tokens: raw.usageMetadata?.promptTokenCount || raw.usage?.input_tokens || raw.usage?.prompt_tokens || null, output_tokens: raw.usageMetadata?.candidatesTokenCount || raw.usage?.output_tokens || raw.usage?.completion_tokens || null }
     });
   } catch (error) {
-    return res.status(error.name === 'AbortError' ? 504 : 502).json({ error: error.name === 'AbortError' ? 'انتهت مهلة التحليل. قلّل حجم المصادر وحاول مجددًا.' : 'تعذر الاتصال بخدمة Gemini.' });
+    return res.status(error.name === 'AbortError' || error.name === 'TimeoutError' ? 504 : 502).json({ error: error.name === 'AbortError' || error.name === 'TimeoutError' ? 'انتهت مهلة التحليل. قلّل حجم المصادر وحاول مجددًا.' : (error.message || 'تعذر الاتصال بمزود الذكاء الاصطناعي.') });
   } finally { clearTimeout(timer); }
 };
