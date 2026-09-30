@@ -1,6 +1,17 @@
 const crypto = require('node:crypto');
 
 const VALID_STATUSES = new Set(['unassessed', 'supported', 'mixed', 'not_observed', 'insufficient', 'not_applicable']);
+const RUBRIC = [
+  ['التحكم بالانتباه','corpus',['هل يتم توجيه التركيز العام نحو قضية واحدة بشكل مبالغ فيه؟','هل توجد ملفات موازية يتم تهميشها أو تجاهلها؟','هل حدث صمت مفاجئ حول موضوع كان حاضرًا سابقًا؟','ما الذي اختفى من المشهد فجأة؟','هل يخدم هذا التركيز عملية إخفاء نشاط آخر؟']],
+  ['الإغراق المعلوماتي','corpus',['هل يتم ضخ عدد كبير من الأخبار دون تطور نوعي حقيقي؟','هل الأخبار متشابهة في الصياغة والمضمون؟','هل تتكرر المصطلحات ذاتها دون إضافة معلومات جديدة؟','هل هناك تقدم فعلي أم مجرد إعادة تدوير للمحتوى؟','هل الكم يغطي على غياب الدليل القوي؟']],
+  ['المصدر المجهول / غير القابل للتحقق','text',['هل تعتمد الرواية على مصادر مطلعة غير محددة؟','هل يتم الاستناد إلى دوائر قريبة أو أطراف ثالثة غامضة؟','هل يمكن مساءلة المصدر أو التحقق منه؟','من المستفيد من الغموض، وما الدليل الذي يربطه به؟','هل يتم خلق سلطة معرفية دون قابلية للفحص؟']],
+  ['التوقيت مع ضغط القرار','context',['هل جاء التسريب أو الخبر قبيل قرار سياسي أو عسكري مهم؟','هل ظهر الخبر عند ذروة توتر أو أزمة؟','لماذا الآن تحديدًا؟','هل يضغط التوقيت على متخذ القرار؟','هل يمكن فصل زمن التحليل عن زمن القرار؟']],
+  ['التماسك السردي المفرط','text',['هل الرواية مكتملة بشكل مريح أكثر من اللازم؟','هل تغيب الفجوات أو مناطق الغموض الطبيعية؟','هل تقدم إجابات جاهزة لكل سؤال محتمل؟','أين التناقض الطبيعي في الرواية؟','هل هذا التماسك يخدم منع التساؤل النقدي؟']],
+  ['تضخيم أو تقليل التهديد','context',['هل الخطاب التهديدي مفرط مقارنة بالفعل؟','هل توجد تحركات رمزية أكثر من كونها عملياتية؟','هل الفعل يوازي الخطاب؟','هل توجد أدلة على محاولة دفع الخصم لرد فعل غير متوازن؟','ما الكلفة الحقيقية مقارنة بحجم التهويل؟']],
+  ['التنسيق المفرط عبر المجالات','corpus',['هل هناك تزامن لافت بين الإعلام والعسكر والسياسة؟','هل يظهر المشهد بإخراج متقن أكثر من المعتاد؟','هل يعكس الواقع عادة هذا القدر من الانضباط؟','ما الدليل الذي يميز التنسيق عن الاستجابة لسبب مشترك؟','كيف يقارن ذلك بالتباين المعتاد في الأحداث؟']],
+  ['رد الفعل المبالغ فيه','context',['هل جاء الرد سريعًا وبشكل تصعيدي غير متدرج؟','هل توجد تحركات لا تتناسب مع الحدث؟','هل يمثل الرد انحرافًا عن السلوك الطبيعي السابق؟','ما الذي يميز الرد الطبيعي عن الاستدراج المحتمل؟','هل توجد أدلة تربط الاستجابة بمحاولة خداع؟']],
+  ['الإغلاق المعرفي','team',['هل حدث إجماع سريع داخل المؤسسة التحليلية؟','هل يتم رفض النقد أو الفرضيات البديلة؟','هل تم اختبار فرضية الخداع بشكل جدي؟','هل افترضنا أننا قد نكون مخدوعين؟','هل أُغلق النقاش قبل استكمال التحليل؟']]
+];
 const schema = {
   type: 'object',
   required: ['summary', 'claims', 'scenarios', 'limitations', 'reviews'],
@@ -23,6 +34,7 @@ function cleanText(value, max = 5000) { return String(value || '').trim().slice(
 
 function buildPrompt(caseFile, language, sources) {
   const sourceBlock = sources.map((s, i) => `\n--- SOURCE ${i + 1} ---\nID: ${s.id}\nTitle: ${s.title}\nPublisher: ${s.publisher || 'unknown'}\nAuthor: ${s.author || 'unknown'}\nDate: ${s.date || 'unknown'}\nShared origin: ${s.origin || 'not supplied'}\nURL: ${s.url || 'not supplied'}\nNotes: ${s.notes || 'none'}\nTEXT:\n${s.text}`).join('\n');
+  const rubricBlock = RUBRIC.map((axis, i) => `\n${i + 1}. ${axis[0]} [scope=${axis[1]}]\n${axis[2].map((q, j) => `${i + 1}.${j + 1} ${q}`).join('\n')}`).join('\n');
   return `You are RAQEEB, an evidence-first verification analyst. Produce a detailed report in ${language}.
 
 INVESTIGATION
@@ -40,8 +52,13 @@ NON-NEGOTIABLE RULES
 7. Cover the central claims in depth, but avoid repetition. Flag internal contradictions and chronology problems.
 8. The 45 review IDs are 1.1–9.5. Include all 45. Status must be one of: supported, mixed, not_observed, insufficient, not_applicable. Confidence must be low, medium, or high.
 9. 'not_observed' means the indicator was actively checked and absent within the supplied scope; 'insufficient' means the supplied material cannot support the check.
+10. Respect the scope label of every axis. corpus requires several independent items or a time series; context requires external baseline/context; team requires documented team-process evidence. If that scope is missing, use insufficient—not a speculative finding.
+11. Do not infer intent, beneficiary, coordination, causation, or deception merely from timing, repetition, anonymity, coherence, or rhetoric. Identify the observable indicator separately from any hypothesis about intent.
 
 For claims, use clear editorial verdicts such as supported, contradicted, partly supported, attributed only, or insufficient evidence, followed by a concrete reason. For scenarios, do not assign probabilities unless the evidence permits it; give support, counter-evidence, and a discriminating future trigger.
+
+THE 45-QUESTION DIAGNOSTIC RUBRIC
+${rubricBlock}
 
 SUPPLIED SOURCES
 ${sourceBlock}`;
