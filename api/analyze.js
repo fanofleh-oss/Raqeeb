@@ -76,8 +76,17 @@ function parseJsonText(text) {
   throw new Error('invalid_json');
 }
 
+function providerError(raw) {
+  if (typeof raw?.error === 'string') return raw.error;
+  if (typeof raw?.error?.message === 'string') return raw.error.message;
+  if (typeof raw?.message === 'string') return raw.message;
+  if (typeof raw?.detail === 'string') return raw.detail;
+  if (Array.isArray(raw?.errors)) return raw.errors.map(item => item?.message || item?.detail || '').filter(Boolean).join(' · ');
+  return '';
+}
+
 function formatUnsupported(raw) {
-  return /response.?format|json.?schema|structured|unknown parameter|unsupported/i.test(String(raw?.error?.message || ''));
+  return /response.?format|json.?schema|structured|unknown parameter|unsupported|not supported/i.test(providerError(raw));
 }
 
 async function postJson(endpoint, headers, payload, signal) {
@@ -192,13 +201,17 @@ module.exports = async function handler(req, res) {
       payload = { model, messages: [{ role: 'user', content: prompt }], temperature: 0.15, response_format: { type: 'json_object' } };
       providerLabel = known?.label || new URL(base).hostname;
       ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
-      if (!response.ok && formatUnsupported(raw)) {
+      if (!response.ok && (formatUnsupported(raw) || response.status === 400 || response.status === 422)) {
         delete payload.response_format;
         ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
       }
       text = chatText(raw);
     }
-    if (!response.ok) return res.status(502).json({ error: raw?.error?.message || `فشل الاتصال مع ${providerLabel}.` });
+    if (!response.ok) {
+      const reason = providerError(raw);
+      console.warn('[api/analyze] provider rejected request', { provider: providerLabel, model, status: response.status, reason: reason.slice(0, 500) });
+      return res.status(502).json({ error: reason || `فشل الاتصال مع ${providerLabel}.` });
+    }
     let parsed;
     try { parsed = parseJsonText(text); } catch { return res.status(502).json({ error: `أعاد ${providerLabel} نتيجة غير قابلة للقراءة. جرّب نموذجًا أقوى أو قلّل حجم المقالات.` }); }
     const sourceMap = new Map(sources.map(s => [s.id, s]));
