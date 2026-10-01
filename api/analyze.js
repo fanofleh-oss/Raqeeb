@@ -61,6 +61,31 @@ function openAiText(raw) {
     .filter(item => item?.type === 'output_text' || typeof item?.text === 'string').map(item => item.text || '').join('');
 }
 
+function chatText(raw) {
+  const content = raw?.choices?.[0]?.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(part => part?.text || part?.content || '').join('');
+  return '';
+}
+
+function parseJsonText(text) {
+  const cleaned = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  try { return JSON.parse(cleaned); } catch {}
+  const start = cleaned.indexOf('{'), end = cleaned.lastIndexOf('}');
+  if (start >= 0 && end > start) return JSON.parse(cleaned.slice(start, end + 1));
+  throw new Error('invalid_json');
+}
+
+function formatUnsupported(raw) {
+  return /response.?format|json.?schema|structured|unknown parameter|unsupported/i.test(String(raw?.error?.message || ''));
+}
+
+async function postJson(endpoint, headers, payload, signal) {
+  const response = await fetch(endpoint, { method: 'POST', signal, headers, body: JSON.stringify(payload) });
+  const raw = await response.json().catch(() => ({}));
+  return { response, raw };
+}
+
 function strictJsonSchema(value) {
   if (Array.isArray(value)) return value.map(strictJsonSchema);
   if (!value || typeof value !== 'object') return value;
@@ -98,14 +123,17 @@ THE 45-QUESTION DIAGNOSTIC RUBRIC
 ${rubricBlock}
 
 SUPPLIED SOURCES
-${sourceBlock}`;
+${sourceBlock}
+
+OUTPUT FORMAT
+Return only one valid JSON object, without Markdown or commentary. It must contain: summary (string), claims (array of {claim, verdict, reason, source_ids}), scenarios (array of {name, assessment, support, against, trigger}), limitations (array of strings), and reviews (array of all 45 {id, status, confidence, source_id, quote, observation, alternative, next_step}).`;
 }
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
   const apiKey = cleanText(req.body?.apiKey || req.body?.geminiKey, 500);
   if (apiKey.length < 12) return res.status(401).json({ error: 'مفتاح مزود الذكاء الاصطناعي مفقود أو غير صالح.' });
-  const provider = ['gemini', 'openai', 'custom'].includes(req.body?.provider) ? req.body.provider : 'gemini';
+  const provider = ['gemini', 'openai', 'huggingface', 'groq', 'custom'].includes(req.body?.provider) ? req.body.provider : 'gemini';
   const caseFile = req.body?.case;
   if (!caseFile || !Array.isArray(caseFile.sources) || !caseFile.sources.length) return res.status(400).json({ error: 'أضف مصدرًا واحدًا على الأقل.' });
   if (caseFile.sources.length > 12) return res.status(400).json({ error: 'الحد الأقصى 12 مصدرًا في العملية الواحدة.' });
@@ -121,36 +149,58 @@ module.exports = async function handler(req, res) {
 
   const requestedModel = cleanText(req.body?.model, 160);
   if (requestedModel && !/^[a-zA-Z0-9._:/-]+$/.test(requestedModel)) return res.status(400).json({ error: 'معرّف النموذج غير صالح.' });
-  const model = requestedModel || (provider === 'gemini' ? 'gemini-2.5-flash' : 'gpt-6.1-sol');
+  const defaults = { gemini: 'gemini-2.5-flash-lite', openai: 'gpt-6.1-sol', huggingface: 'openai/gpt-oss-120b:fastest', groq: 'openai/gpt-oss-20b', custom: '' };
+  const model = requestedModel || defaults[provider];
+  if (!model) return res.status(400).json({ error: 'اختر نموذجًا أو اكتب معرّف النموذج.' });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 55000);
   try {
     const prompt = buildPrompt(caseFile, cleanText(req.body.language, 80) || 'Arabic', sources);
-    let endpoint, headers = { 'Content-Type': 'application/json' }, payload, providerLabel;
+    let endpoint, headers = { 'Content-Type': 'application/json' }, payload, providerLabel, response, raw, text;
     if (provider === 'gemini') {
       if (!/^[a-zA-Z0-9._-]+$/.test(model)) return res.status(400).json({ error: 'معرّف نموذج Gemini غير صالح.' });
       endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
       payload = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.15, responseMimeType: 'application/json', responseSchema: schema } };
       providerLabel = 'Google Gemini';
+      ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
+      if (!response.ok && formatUnsupported(raw)) {
+        payload.generationConfig = { temperature: 0.15, responseMimeType: 'application/json' };
+        ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
+      }
+      text = raw?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
     } else if (provider === 'openai') {
       endpoint = 'https://api.openai.com/v1/responses';
       headers.Authorization = `Bearer ${apiKey}`;
       payload = { model, input: prompt, text: { format: { type: 'json_schema', name: 'raqeeb_analysis', strict: true, schema: strictJsonSchema(schema) } } };
       providerLabel = 'OpenAI';
+      ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
+      if (!response.ok && (formatUnsupported(raw) || response.status === 404)) {
+        endpoint = 'https://api.openai.com/v1/chat/completions';
+        payload = { model, messages: [{ role: 'user', content: prompt }], temperature: 0.15, response_format: { type: 'json_object' } };
+        ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
+        if (!response.ok && formatUnsupported(raw)) {
+          delete payload.response_format;
+          ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
+        }
+        text = chatText(raw);
+      } else text = openAiText(raw);
     } else {
-      const base = await safeBaseUrl(cleanText(req.body?.baseUrl, 1000));
+      const known = provider === 'huggingface' ? { base: 'https://router.huggingface.co/v1', label: 'Hugging Face' } : provider === 'groq' ? { base: 'https://api.groq.com/openai/v1', label: 'Groq' } : null;
+      const base = known?.base || await safeBaseUrl(cleanText(req.body?.baseUrl, 1000));
       endpoint = `${base}/chat/completions`;
       headers.Authorization = `Bearer ${apiKey}`;
       payload = { model, messages: [{ role: 'user', content: prompt }], temperature: 0.15, response_format: { type: 'json_object' } };
-      providerLabel = new URL(base).hostname;
+      providerLabel = known?.label || new URL(base).hostname;
+      ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
+      if (!response.ok && formatUnsupported(raw)) {
+        delete payload.response_format;
+        ({ response, raw } = await postJson(endpoint, headers, payload, controller.signal));
+      }
+      text = chatText(raw);
     }
-    const response = await fetch(endpoint, { method: 'POST', signal: controller.signal, headers, body: JSON.stringify(payload) });
-    const raw = await response.json();
     if (!response.ok) return res.status(502).json({ error: raw?.error?.message || `فشل الاتصال مع ${providerLabel}.` });
-    const text = provider === 'gemini' ? (raw?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '') :
-      provider === 'openai' ? openAiText(raw) : (raw?.choices?.[0]?.message?.content || '');
     let parsed;
-    try { parsed = JSON.parse(text); } catch { return res.status(502).json({ error: `أعاد ${providerLabel} نتيجة غير قابلة للقراءة. أعد المحاولة أو اختر نموذجًا يدعم JSON.` }); }
+    try { parsed = parseJsonText(text); } catch { return res.status(502).json({ error: `أعاد ${providerLabel} نتيجة غير قابلة للقراءة. جرّب نموذجًا أقوى أو قلّل حجم المقالات.` }); }
     const sourceMap = new Map(sources.map(s => [s.id, s]));
     const reviews = {};
     for (const item of Array.isArray(parsed.reviews) ? parsed.reviews : []) {
